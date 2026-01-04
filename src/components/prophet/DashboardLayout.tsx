@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import { useAuth } from "@/auth/AuthProvider";
 
 interface NavItem {
   id: string;
@@ -36,6 +37,7 @@ interface DashboardLayoutProps {
 
 export function DashboardLayout({ children, activeView, onViewChange }: DashboardLayoutProps) {
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const { user, logout } = useAuth();
 
   return (
     <div className="min-h-screen bg-background prophet-grid-bg">
@@ -148,6 +150,14 @@ export function DashboardLayout({ children, activeView, onViewChange }: Dashboar
                 <div className="w-2 h-2 rounded-full bg-prophet-success animate-pulse" />
                 <span className="text-muted-foreground">Systems Operational</span>
               </div>
+              {user && (
+                <div className="flex items-center gap-3 text-sm">
+                  <span className="text-muted-foreground">{user.email}</span>
+                  <Button variant="ghost" size="sm" onClick={() => logout()}>
+                    Sign out
+                  </Button>
+                </div>
+              )}
             </div>
           </div>
         </header>
