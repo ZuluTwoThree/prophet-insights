@@ -1,14 +1,14 @@
 import { Hono } from "hono";
-import type { AppEnv } from "./types";
+import type { AppEnv } from "./types.js";
 import { logger } from "hono/logger";
 import { cors } from "hono/cors";
 import { serve } from "@hono/node-server";
-import { serveStatic } from "hono/serve-static";
+import { serveStatic } from "@hono/node-server/serve-static";
 import path from "node:path";
 import { readFile } from "node:fs/promises";
-import { authRoutes } from "./routes/auth";
-import { env, isProd } from "./env";
-import { sessionMiddleware } from "./middleware/session";
+import { authRoutes } from "./routes/auth.js";
+import { env, isProd } from "./env.js";
+import { sessionMiddleware } from "./middleware/session.js";
 
 const app = new Hono<AppEnv>();
 

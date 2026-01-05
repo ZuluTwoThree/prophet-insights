@@ -5,13 +5,13 @@ import { and, eq } from "drizzle-orm";
 import { getCookie, setCookie, deleteCookie } from "hono/cookie";
 import { generateCodeVerifier, generateState } from "arctic";
 import { randomUUID } from "node:crypto";
-import { lucia } from "../auth/lucia";
-import { github, google } from "../auth/oauth";
-import { hashPassword, verifyPassword } from "../auth/password";
-import { db } from "../db/client";
-import { oauthAccounts, users } from "../db/schema";
-import { env, isProd } from "../env";
-import type { AppEnv } from "../types";
+import { lucia } from "../auth/lucia.js";
+import { github, google } from "../auth/oauth.js";
+import { hashPassword, verifyPassword } from "../auth/password.js";
+import { db } from "../db/client.js";
+import { oauthAccounts, users } from "../db/schema.js";
+import { env, isProd } from "../env.js";
+import type { AppEnv } from "../types.js";
 
 const registerSchema = z.object({
   email: z.string().email(),
@@ -174,7 +174,11 @@ auth.get("/github/callback", async (c) => {
   if (!userResponse.ok) {
     return c.json({ error: "Failed to fetch GitHub profile." }, 502);
   }
-  const githubUser = await userResponse.json();
+  const githubUser = (await userResponse.json()) as {
+    id: number;
+    login?: string;
+    name?: string | null;
+  };
 
   const emailResponse = await fetch("https://api.github.com/user/emails", {
     headers: { Authorization: `Bearer ${accessToken}` },
@@ -182,7 +186,11 @@ auth.get("/github/callback", async (c) => {
   if (!emailResponse.ok) {
     return c.json({ error: "Failed to fetch GitHub emails." }, 502);
   }
-  const emails: Array<{ email: string; primary: boolean; verified: boolean }> = await emailResponse.json();
+  const emails = (await emailResponse.json()) as Array<{
+    email: string;
+    primary: boolean;
+    verified: boolean;
+  }>;
   const primaryEmail =
     emails.find((entry) => entry.primary && entry.verified)?.email ?? emails[0]?.email ?? null;
 
@@ -190,6 +198,7 @@ auth.get("/github/callback", async (c) => {
     return c.json({ error: "No email available from GitHub." }, 400);
   }
 
+  const githubTokenMeta = tokens as { refreshToken?: string; accessTokenExpiresAt?: Date };
   const { userId } = await findOrCreateOAuthUser({
     provider: "github",
     providerUserId: String(githubUser.id),
@@ -197,8 +206,8 @@ auth.get("/github/callback", async (c) => {
     name: githubUser.name ?? githubUser.login ?? null,
     emailVerified: true,
     accessToken: tokens.accessToken,
-    refreshToken: "refreshToken" in tokens ? tokens.refreshToken : null,
-    expiresAt: "accessTokenExpiresAt" in tokens ? tokens.accessTokenExpiresAt : null,
+    refreshToken: typeof githubTokenMeta.refreshToken === "string" ? githubTokenMeta.refreshToken : null,
+    expiresAt: githubTokenMeta.accessTokenExpiresAt instanceof Date ? githubTokenMeta.accessTokenExpiresAt : null,
   });
 
   await createSessionAndRedirect(c, userId);
@@ -248,13 +257,14 @@ auth.get("/google/callback", async (c) => {
   if (!userInfoResponse.ok) {
     return c.json({ error: "Failed to fetch Google profile." }, 502);
   }
-  const googleUser: {
+  const googleUser = (await userInfoResponse.json()) as {
     sub: string;
     email: string;
     email_verified: boolean;
     name?: string;
-  } = await userInfoResponse.json();
+  };
 
+  const googleTokenMeta = tokens as { refreshToken?: string; accessTokenExpiresAt?: Date };
   const { userId } = await findOrCreateOAuthUser({
     provider: "google",
     providerUserId: googleUser.sub,
@@ -262,8 +272,8 @@ auth.get("/google/callback", async (c) => {
     name: googleUser.name ?? null,
     emailVerified: googleUser.email_verified,
     accessToken: tokens.accessToken,
-    refreshToken: "refreshToken" in tokens ? tokens.refreshToken : null,
-    expiresAt: "accessTokenExpiresAt" in tokens ? tokens.accessTokenExpiresAt : null,
+    refreshToken: typeof googleTokenMeta.refreshToken === "string" ? googleTokenMeta.refreshToken : null,
+    expiresAt: googleTokenMeta.accessTokenExpiresAt instanceof Date ? googleTokenMeta.accessTokenExpiresAt : null,
   });
 
   await createSessionAndRedirect(c, userId);

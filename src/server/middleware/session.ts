@@ -1,6 +1,6 @@
 import type { MiddlewareHandler } from "hono";
-import { lucia } from "../auth/lucia";
-import type { AppEnv } from "../types";
+import { lucia } from "../auth/lucia.js";
+import type { AppEnv } from "../types.js";
 
 export const sessionMiddleware: MiddlewareHandler<AppEnv> = async (c, next) => {
   const cookieHeader = c.req.header("Cookie") ?? "";
