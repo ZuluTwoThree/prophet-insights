@@ -7,6 +7,7 @@ import { serveStatic } from "@hono/node-server/serve-static";
 import path from "node:path";
 import { readFile } from "node:fs/promises";
 import { authRoutes } from "./routes/auth.js";
+import { patentsRoutes } from "./routes/patents.js";
 import { env, isProd } from "./env.js";
 import { sessionMiddleware } from "./middleware/session.js";
 
@@ -18,6 +19,7 @@ app.use("/api/*", sessionMiddleware);
 
 app.get("/api/health", (c) => c.json({ status: "ok" }));
 app.route("/api/auth", authRoutes);
+app.route("/api/patents", patentsRoutes);
 
 if (isProd) {
   const clientDir = path.resolve(process.cwd(), "dist/client");

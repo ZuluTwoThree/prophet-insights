@@ -2,6 +2,7 @@
 import "dotenv/config";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
+import { BigQuery } from "@google-cloud/bigquery";
 import { db, client } from "../src/server/db/client";
 import {
   assignees,
@@ -14,46 +15,23 @@ import {
   patents,
 } from "../src/server/db/schema";
 
-type PatentApiRecord = {
-  patent_number: string;
-  patent_title?: string;
-  patent_abstract?: string;
-  patent_date?: string;
-  app_date?: string;
+type LocalizedText = {
+  text?: string;
+  language?: string;
+};
+
+type BigQueryPatentRecord = {
+  publication_number?: string;
+  publication_date?: string;
+  filing_date?: string;
   priority_date?: string;
-  cpcs?: Array<{
-    cpc_subgroup_id?: string;
-    cpc_group_id?: string;
-    cpc_subclass_id?: string;
-    cpc_section_id?: string;
-    cpc_subgroup_title?: string;
-  }>;
-  ipcs?: Array<{
-    ipc_classification_symbol?: string;
-    ipc_section?: string;
-    ipc_class?: string;
-    ipc_main_group?: string;
-    ipc_subgroup?: string;
-  }>;
-  assignees?: Array<{
-    assignee_id?: string;
-    assignee_organization?: string;
-    assignee_lastknown_country?: string;
-    assignee_lastknown_state?: string;
-    assignee_lastknown_city?: string;
-  }>;
-  inventors?: Array<{
-    inventor_id?: string;
-    inventor_first_name?: string;
-    inventor_last_name?: string;
-    inventor_country?: string;
-    inventor_state?: string;
-    inventor_city?: string;
-  }>;
-  cited_patents?: Array<{
-    cited_patent_number?: string;
-    citation_category?: string;
-  }>;
+  title_localized?: LocalizedText[];
+  abstract_localized?: LocalizedText[];
+  cpc?: Array<Record<string, unknown>>;
+  ipc?: Array<Record<string, unknown>>;
+  assignee_harmonized?: Array<Record<string, unknown>>;
+  inventor_harmonized?: Array<Record<string, unknown>>;
+  citation?: Array<Record<string, unknown>>;
 };
 
 type NormalizedPatent = {
@@ -63,6 +41,7 @@ type NormalizedPatent = {
   claims?: string;
   ipcCodes: string[];
   cpcCodes: string[];
+  publicationDate?: string;
   priorityDate?: string;
   filingDate?: string;
   assignees: Array<{
@@ -89,6 +68,7 @@ function parseArgs() {
     limit: 50,
     pageSize: 25,
     startDate: "2024-01-01",
+    endDate: undefined as string | undefined,
     sourceFile: undefined as string | undefined,
   };
 
@@ -102,6 +82,7 @@ function parseArgs() {
     limit: Number(parsed.limit ?? defaults.limit),
     pageSize: Number(parsed.pageSize ?? defaults.pageSize),
     startDate: parsed.startDate ?? defaults.startDate,
+    endDate: parsed.endDate ?? defaults.endDate,
     sourceFile: parsed.sourceFile ?? defaults.sourceFile,
   };
 }
@@ -110,129 +91,249 @@ async function readLocalSource(path: string) {
   const buffer = await fs.readFile(path, "utf8");
   const data = JSON.parse(buffer);
   if (!Array.isArray(data)) {
-    throw new Error("Local source file must contain an array of patent objects");
+    throw new Error("Local source file must contain an array of BigQuery patent objects");
   }
-  return data as PatentApiRecord[];
+  return data as BigQueryPatentRecord[];
 }
 
-async function fetchFromPatentsView(
+function resolveTableId() {
+  const dataset = process.env.BIGQUERY_DATASET ?? "patents-public-data.patents";
+  const table = process.env.BIGQUERY_TABLE ?? "publications";
+  if (dataset.includes(".")) {
+    return `${dataset}.${table}`;
+  }
+  const projectId = process.env.BIGQUERY_PROJECT_ID;
+  if (!projectId) {
+    return `${dataset}.${table}`;
+  }
+  return `${projectId}.${dataset}.${table}`;
+}
+
+async function fetchFromBigQuery(
   page: number,
   perPage: number,
   startDate?: string,
-): Promise<PatentApiRecord[]> {
-  const body = {
-    q: startDate ? { _gte: { patent_date: startDate } } : {},
-    f: [
-      "patent_number",
-      "patent_title",
-      "patent_abstract",
-      "patent_date",
-      "app_date",
-      "priority_date",
-    ],
-    o: { page, per_page: perPage },
-    include_subentity_total_counts: false,
-    include: ["assignees", "inventors", "cpcs", "ipcs", "cited_patents"],
-  };
+  endDate?: string,
+): Promise<BigQueryPatentRecord[]> {
+  const tableId = resolveTableId();
+  const offset = (page - 1) * perPage;
 
-  const response = await fetch("https://api.patentsview.org/patents/query", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+  const bigquery = new BigQuery({
+    projectId: process.env.BIGQUERY_PROJECT_ID || undefined,
   });
 
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Failed to fetch patents: ${response.status} ${text}`);
+  const dateFilter = startDate ? "publication_date >= @startDate" : "1=1";
+  const endFilter = endDate ? "AND publication_date <= @endDate" : "";
+
+  const query = `
+    SELECT
+      publication_number,
+      publication_date,
+      filing_date,
+      priority_date,
+      title_localized,
+      abstract_localized,
+      cpc,
+      ipc,
+      assignee_harmonized,
+      inventor_harmonized,
+      citation
+    FROM \`${tableId}\`
+    WHERE ${dateFilter}
+    ${endFilter}
+    ORDER BY publication_date DESC
+    LIMIT @limit
+    OFFSET @offset
+  `;
+
+  const params: Record<string, string | number> = {
+    limit: perPage,
+    offset,
+  };
+
+  if (startDate) {
+    params.startDate = startDate;
   }
 
-  const payload = (await response.json()) as { patents?: PatentApiRecord[] };
-  return payload.patents ?? [];
+  if (endDate) {
+    params.endDate = endDate;
+  }
+
+  const options = {
+    query,
+    location: process.env.BIGQUERY_LOCATION ?? "US",
+    params,
+  };
+
+  const [rows] = await bigquery.query(options);
+  return rows as BigQueryPatentRecord[];
 }
 
-function normalizeClassificationCodes(record: PatentApiRecord) {
-  const cpcCodes =
-    record.cpcs?.map(
-      (cpc) =>
-        cpc.cpc_subgroup_id ??
-        cpc.cpc_group_id ??
-        cpc.cpc_subclass_id ??
-        cpc.cpc_section_id ??
-        "",
-    ) ?? [];
+function pickLocalizedText(entries?: LocalizedText[]) {
+  if (!entries?.length) return undefined;
+  const english = entries.find((entry) => (entry.language ?? "").toLowerCase().startsWith("en"));
+  return english?.text ?? entries[0]?.text;
+}
 
-  const ipcCodes =
-    record.ipcs?.map((ipc) => ipc.ipc_classification_symbol ?? ipc.ipc_section ?? "").filter(Boolean) ??
-    [];
+function readString(value: unknown) {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed) return trimmed;
+  }
+  return undefined;
+}
+
+function getString(record: Record<string, unknown> | null | undefined, keys: string[]) {
+  if (!record) return undefined;
+  for (const key of keys) {
+    const value = readString(record[key]);
+    if (value) return value;
+  }
+  return undefined;
+}
+
+function splitName(name?: string) {
+  if (!name) return { firstName: undefined, lastName: undefined };
+  const parts = name.trim().split(/\s+/);
+  if (parts.length === 1) {
+    return { firstName: parts[0], lastName: undefined };
+  }
+  return {
+    firstName: parts.slice(0, -1).join(" "),
+    lastName: parts[parts.length - 1],
+  };
+}
+
+function normalizeClassificationCodes(record: BigQueryPatentRecord) {
+  const cpcEntries = Array.isArray(record.cpc) ? record.cpc : [];
+  const ipcEntries = Array.isArray(record.ipc) ? record.ipc : [];
+
+  const cpcCodes = cpcEntries
+    .map((entry) =>
+      readString(entry.code) ??
+      readString(entry.cpc_subgroup_id) ??
+      readString(entry.subgroup_id) ??
+      readString(entry.cpc_group_id) ??
+      readString(entry.group_id) ??
+      readString(entry.cpc_subclass_id) ??
+      readString(entry.subclass_id) ??
+      readString(entry.cpc_section_id) ??
+      readString(entry.section_id) ??
+      "",
+    )
+    .filter(Boolean);
+
+  const ipcCodes = ipcEntries
+    .map((entry) =>
+      readString(entry.code) ??
+      readString(entry.symbol) ??
+      readString(entry.ipc_classification_symbol) ??
+      readString(entry.ipc_section) ??
+      "",
+    )
+    .filter(Boolean);
 
   return {
-    cpcCodes: cpcCodes.filter(Boolean),
+    cpcCodes,
     ipcCodes,
   };
 }
 
-function normalizePatent(record: PatentApiRecord): NormalizedPatent | null {
-  if (!record.patent_number) return null;
+function normalizeBigQueryPatent(record: BigQueryPatentRecord): NormalizedPatent | null {
+  const id = record.publication_number;
+  if (!id) return null;
 
   const { cpcCodes, ipcCodes } = normalizeClassificationCodes(record);
+  const title = pickLocalizedText(record.title_localized);
+  const abstract = pickLocalizedText(record.abstract_localized);
+
+  const assigneeEntries = Array.isArray(record.assignee_harmonized) ? record.assignee_harmonized : [];
+  const inventorEntries = Array.isArray(record.inventor_harmonized) ? record.inventor_harmonized : [];
+  const citationEntries = Array.isArray(record.citation) ? record.citation : [];
+  const cpcEntries = Array.isArray(record.cpc) ? record.cpc : [];
 
   return {
-    id: record.patent_number,
-    title: record.patent_title,
-    abstract: record.patent_abstract,
+    id,
+    title,
+    abstract,
     claims: undefined,
     ipcCodes,
     cpcCodes,
+    publicationDate: record.publication_date ?? undefined,
     priorityDate: record.priority_date ?? undefined,
-    filingDate: record.app_date ?? undefined,
-    assignees:
-      record.assignees?.flatMap((assignee) => {
-        if (!assignee.assignee_id && !assignee.assignee_organization) return [];
-        return [
-          {
-            id: assignee.assignee_id ?? assignee.assignee_organization ?? crypto.randomUUID(),
-            name: assignee.assignee_organization ?? "Unknown Assignee",
-            country: assignee.assignee_lastknown_country ?? undefined,
-            state: assignee.assignee_lastknown_state ?? undefined,
-            city: assignee.assignee_lastknown_city ?? undefined,
-          },
-        ];
-      }) ?? [],
-    inventors:
-      record.inventors?.flatMap((inventor) => {
-        if (!inventor.inventor_id && !inventor.inventor_last_name) return [];
-        return [
-          {
-            id: inventor.inventor_id ?? crypto.randomUUID(),
-            firstName: inventor.inventor_first_name ?? undefined,
-            lastName: inventor.inventor_last_name ?? undefined,
-            country: inventor.inventor_country ?? undefined,
-            state: inventor.inventor_state ?? undefined,
-            city: inventor.inventor_city ?? undefined,
-          },
-        ];
-      }) ?? [],
+    filingDate: record.filing_date ?? undefined,
+    assignees: assigneeEntries.flatMap((assignee) => {
+      const name =
+        getString(assignee, ["name", "organization", "assignee_organization"]) ?? "Unknown Assignee";
+      const idValue = getString(assignee, ["assignee_id", "id"]) ?? name;
+      if (!name) return [];
+      return [
+        {
+          id: idValue,
+          name,
+          country: getString(assignee, ["country_code", "country"]),
+          state: getString(assignee, ["state", "region"]),
+          city: getString(assignee, ["city"]),
+        },
+      ];
+    }),
+    inventors: inventorEntries.flatMap((inventor) => {
+      const firstName =
+        getString(inventor, ["first_name", "given_name", "firstName", "inventor_first_name"]) ?? undefined;
+      const lastName =
+        getString(inventor, ["last_name", "family_name", "lastName", "inventor_last_name"]) ?? undefined;
+      const name = getString(inventor, ["name", "name_full", "inventor_name"]);
+      const split = splitName(name);
+      const resolvedFirst = firstName ?? split.firstName;
+      const resolvedLast = lastName ?? split.lastName;
+      if (!resolvedFirst && !resolvedLast) return [];
+      return [
+        {
+          id: getString(inventor, ["inventor_id", "id"]) ?? crypto.randomUUID(),
+          firstName: resolvedFirst,
+          lastName: resolvedLast,
+          country: getString(inventor, ["country_code", "country"]),
+          state: getString(inventor, ["state", "region"]),
+          city: getString(inventor, ["city"]),
+        },
+      ];
+    }),
     classifications: [
       ...ipcCodes.map((code) => ({ code, scheme: "ipc" as const, description: undefined })),
-      ...cpcCodes.map((code) => ({
-        code,
-        scheme: "cpc" as const,
-        description:
-          record.cpcs?.find(
-            (cpc) =>
-              code ===
-              (cpc.cpc_subgroup_id ??
-                cpc.cpc_group_id ??
-                cpc.cpc_subclass_id ??
-                cpc.cpc_section_id),
-          )?.cpc_subgroup_title ?? undefined,
-      })),
+      ...cpcCodes.map((code) => {
+        const entry = cpcEntries.find((cpc) =>
+          [
+            cpc.code,
+            cpc.cpc_subgroup_id,
+            cpc.subgroup_id,
+            cpc.cpc_group_id,
+            cpc.group_id,
+            cpc.cpc_subclass_id,
+            cpc.subclass_id,
+            cpc.cpc_section_id,
+            cpc.section_id,
+          ]
+            .map(readString)
+            .includes(code),
+        );
+        return {
+          code,
+          scheme: "cpc" as const,
+          description:
+            getString(entry, ["title", "description", "cpc_subgroup_title"]) ?? undefined,
+        };
+      }),
     ],
-    citations:
-      record.cited_patents?.map((citation) => ({
-        citedPatentId: citation.cited_patent_number ?? undefined,
-        type: citation.citation_category ?? undefined,
-      })) ?? [],
+    citations: citationEntries.map((citation) => ({
+      citedPatentId:
+        getString(citation, [
+          "publication_number",
+          "cited_publication_number",
+          "cited_patent_number",
+          "citation_publication_number",
+        ]) ?? undefined,
+      type: getString(citation, ["category", "citation_category", "citation_type"]) ?? undefined,
+    })),
   };
 }
 
@@ -247,6 +348,7 @@ async function upsertPatents(patentBatch: NormalizedPatent[]) {
         claims: patent.claims,
         ipc: patent.ipcCodes.join(", "),
         cpc: patent.cpcCodes.join(", "),
+        publicationDate: patent.publicationDate ? new Date(patent.publicationDate) : null,
         priorityDate: patent.priorityDate ? new Date(patent.priorityDate) : null,
         filingDate: patent.filingDate ? new Date(patent.filingDate) : null,
       })
@@ -258,6 +360,7 @@ async function upsertPatents(patentBatch: NormalizedPatent[]) {
           claims: patent.claims,
           ipc: patent.ipcCodes.join(", "),
           cpc: patent.cpcCodes.join(", "),
+          publicationDate: patent.publicationDate ? new Date(patent.publicationDate) : null,
           priorityDate: patent.priorityDate ? new Date(patent.priorityDate) : null,
           filingDate: patent.filingDate ? new Date(patent.filingDate) : null,
           updatedAt: new Date(),
@@ -376,12 +479,11 @@ async function upsertPatents(patentBatch: NormalizedPatent[]) {
         });
     }
   }
-
 }
 
 async function main() {
   const args = parseArgs();
-  const batches: PatentApiRecord[][] = [];
+  const batches: BigQueryPatentRecord[][] = [];
 
   if (args.sourceFile) {
     batches.push(await readLocalSource(args.sourceFile));
@@ -389,23 +491,20 @@ async function main() {
     let fetched = 0;
     let page = 1;
     while (fetched < args.limit) {
-      try {
-        const patents = await fetchFromPatentsView(page, args.pageSize, args.startDate);
-        if (!patents.length) break;
-        batches.push(patents);
-        fetched += patents.length;
-        page += 1;
-      } catch (error) {
-        console.error("Network ingest failed; rethrowing for visibility.", error);
-        throw error;
-      }
+      const rows = await fetchFromBigQuery(page, args.pageSize, args.startDate, args.endDate);
+      if (!rows.length) break;
+      const remaining = args.limit - fetched;
+      const batch = rows.slice(0, remaining);
+      batches.push(batch);
+      fetched += batch.length;
+      page += 1;
     }
   }
 
   const normalized: NormalizedPatent[] = [];
   for (const batch of batches) {
     for (const record of batch) {
-      const item = normalizePatent(record);
+      const item = normalizeBigQueryPatent(record);
       if (item) normalized.push(item);
     }
   }

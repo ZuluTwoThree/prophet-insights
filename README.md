@@ -48,9 +48,10 @@ npm run db:migrate
 
 ## Patent ingestion
 
-- Import patents locally with `npx tsx scripts/ingest-patents.ts --limit=100 --pageSize=25 --startDate=2024-01-01`.
-- Provide `--sourceFile=path/to/local.json` to ingest pre-downloaded patent data when network access is restricted.
-- A scheduled GitHub Actions workflow (`.github/workflows/patent-ingest.yml`) runs weekly and can be triggered manually to keep the database updated (requires a `DATABASE_URL` secret and optional `PATENT_INGEST_*` variables).
+- Import patents from BigQuery with `npx tsx scripts/ingest-patents.ts --limit=100 --pageSize=25 --startDate=2024-01-01`.
+- Provide `--endDate=YYYY-MM-DD` to bound the query window and `--sourceFile=path/to/local.json` to ingest exported BigQuery data.
+- BigQuery config is read from `GOOGLE_APPLICATION_CREDENTIALS` (service account JSON), `BIGQUERY_PROJECT_ID`, `BIGQUERY_LOCATION` (default `US`), `BIGQUERY_DATASET` (default `patents-public-data.patents`), and `BIGQUERY_TABLE` (default `publications`).
+- A scheduled GitHub Actions workflow (`.github/workflows/patent-ingest.yml`) runs weekly and can be triggered manually to keep the database updated (requires a `DATABASE_URL` secret and BigQuery creds via `GOOGLE_APPLICATION_CREDENTIALS`).
 
 ## Production
 

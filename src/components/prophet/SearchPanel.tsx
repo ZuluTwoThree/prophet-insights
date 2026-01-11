@@ -3,22 +3,33 @@ import { Search, FileText, ExternalLink, Calendar, Building2, Users } from "luci
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { mockSearchResults } from "@/lib/mockData";
 import type { SearchResult } from "@/types/prophet";
 
 export function SearchPanel() {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<SearchResult[]>([]);
   const [isSearching, setIsSearching] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const handleSearch = async () => {
     if (!query.trim()) return;
     
     setIsSearching(true);
-    // Simulate API call
-    await new Promise((resolve) => setTimeout(resolve, 800));
-    setResults(mockSearchResults);
-    setIsSearching(false);
+    setError(null);
+    try {
+      const response = await fetch(`/api/patents/search?q=${encodeURIComponent(query.trim())}`);
+      if (!response.ok) {
+        throw new Error(`Search failed (${response.status})`);
+      }
+      const payload = (await response.json()) as { results?: SearchResult[] };
+      setResults(payload.results ?? []);
+    } catch (err) {
+      console.error(err);
+      setResults([]);
+      setError("Search failed. Please try again.");
+    } finally {
+      setIsSearching(false);
+    }
   };
 
   return (
@@ -59,11 +70,14 @@ export function SearchPanel() {
         </div>
         
         <p className="text-sm text-muted-foreground mt-3">
-          Powered by text-embedding-3-small • PII redacted • Milvus HNSW index
+          Powered by live patent index • Keyword + metadata match
         </p>
       </div>
 
       {/* Results */}
+      {error && (
+        <div className="text-sm text-destructive">{error}</div>
+      )}
       {results.length > 0 && (
         <div className="space-y-4">
           <div className="flex items-center justify-between">

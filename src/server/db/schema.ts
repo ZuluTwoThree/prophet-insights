@@ -55,6 +55,7 @@ export const patents = pgTable("patent", {
   claims: text("claims"),
   ipc: text("ipc"),
   cpc: text("cpc"),
+  publicationDate: date("publication_date"),
   priorityDate: date("priority_date"),
   filingDate: date("filing_date"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
