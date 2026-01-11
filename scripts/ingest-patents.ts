@@ -122,8 +122,10 @@ async function fetchFromBigQuery(
     projectId: process.env.BIGQUERY_PROJECT_ID || undefined,
   });
 
-  const dateFilter = startDate ? "publication_date >= @startDate" : "1=1";
-  const endFilter = endDate ? "AND publication_date <= @endDate" : "";
+  const startDateInt = toDateInt(startDate);
+  const endDateInt = toDateInt(endDate);
+  const dateFilter = startDateInt ? "publication_date >= @startDate" : "1=1";
+  const endFilter = endDateInt ? "AND publication_date <= @endDate" : "";
 
   const query = `
     SELECT
@@ -151,12 +153,12 @@ async function fetchFromBigQuery(
     offset,
   };
 
-  if (startDate) {
-    params.startDate = startDate;
+  if (startDateInt) {
+    params.startDate = startDateInt;
   }
 
-  if (endDate) {
-    params.endDate = endDate;
+  if (endDateInt) {
+    params.endDate = endDateInt;
   }
 
   const options = {
@@ -202,6 +204,35 @@ function splitName(name?: string) {
     firstName: parts.slice(0, -1).join(" "),
     lastName: parts[parts.length - 1],
   };
+}
+
+function toDateInt(value?: string) {
+  if (!value) return undefined;
+  const cleaned = value.replace(/-/g, "");
+  if (!/^\d{8}$/.test(cleaned)) return undefined;
+  return Number(cleaned);
+}
+
+function toDateString(value?: string | number | Date | null) {
+  if (!value) return undefined;
+  if (value instanceof Date) {
+    return value.toISOString().slice(0, 10);
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const padded = String(Math.trunc(value)).padStart(8, "0");
+    if (!/^\d{8}$/.test(padded)) return undefined;
+    return `${padded.slice(0, 4)}-${padded.slice(4, 6)}-${padded.slice(6, 8)}`;
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (/^\d{8}$/.test(trimmed)) {
+      return `${trimmed.slice(0, 4)}-${trimmed.slice(4, 6)}-${trimmed.slice(6, 8)}`;
+    }
+    if (/^\d{4}-\d{2}-\d{2}/.test(trimmed)) {
+      return trimmed.slice(0, 10);
+    }
+  }
+  return undefined;
 }
 
 function normalizeClassificationCodes(record: BigQueryPatentRecord) {
@@ -259,9 +290,9 @@ function normalizeBigQueryPatent(record: BigQueryPatentRecord): NormalizedPatent
     claims: undefined,
     ipcCodes,
     cpcCodes,
-    publicationDate: record.publication_date ?? undefined,
-    priorityDate: record.priority_date ?? undefined,
-    filingDate: record.filing_date ?? undefined,
+    publicationDate: toDateString(record.publication_date ?? null),
+    priorityDate: toDateString(record.priority_date ?? null),
+    filingDate: toDateString(record.filing_date ?? null),
     assignees: assigneeEntries.flatMap((assignee) => {
       const name =
         getString(assignee, ["name", "organization", "assignee_organization"]) ?? "Unknown Assignee";
@@ -348,9 +379,9 @@ async function upsertPatents(patentBatch: NormalizedPatent[]) {
         claims: patent.claims,
         ipc: patent.ipcCodes.join(", "),
         cpc: patent.cpcCodes.join(", "),
-        publicationDate: patent.publicationDate ? new Date(patent.publicationDate) : null,
-        priorityDate: patent.priorityDate ? new Date(patent.priorityDate) : null,
-        filingDate: patent.filingDate ? new Date(patent.filingDate) : null,
+        publicationDate: patent.publicationDate ?? null,
+        priorityDate: patent.priorityDate ?? null,
+        filingDate: patent.filingDate ?? null,
       })
       .onConflictDoUpdate({
         target: patents.id,
@@ -360,9 +391,9 @@ async function upsertPatents(patentBatch: NormalizedPatent[]) {
           claims: patent.claims,
           ipc: patent.ipcCodes.join(", "),
           cpc: patent.cpcCodes.join(", "),
-          publicationDate: patent.publicationDate ? new Date(patent.publicationDate) : null,
-          priorityDate: patent.priorityDate ? new Date(patent.priorityDate) : null,
-          filingDate: patent.filingDate ? new Date(patent.filingDate) : null,
+          publicationDate: patent.publicationDate ?? null,
+          priorityDate: patent.priorityDate ?? null,
+          filingDate: patent.filingDate ?? null,
           updatedAt: new Date(),
         },
       });
