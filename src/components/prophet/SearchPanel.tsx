@@ -11,6 +11,11 @@ export function SearchPanel() {
   const [isSearching, setIsSearching] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const toGooglePatentsUrl = (patentId: string) => {
+    const normalized = patentId.replace(/[^A-Za-z0-9]/g, "");
+    return `https://patents.google.com/patent/${normalized}`;
+  };
+
   const handleSearch = async () => {
     if (!query.trim()) return;
     
@@ -134,8 +139,21 @@ export function SearchPanel() {
                   </div>
                 </div>
                 
-                <Button variant="ghost" size="iconSm" className="shrink-0 opacity-0 group-hover:opacity-100 transition-opacity">
-                  <ExternalLink className="h-4 w-4" />
+                <Button
+                  asChild
+                  variant="ghost"
+                  size="iconSm"
+                  className="shrink-0 opacity-0 group-hover:opacity-100 transition-opacity"
+                >
+                  <a
+                    href={toGooglePatentsUrl(result.patent.id)}
+                    target="_blank"
+                    rel="noreferrer"
+                    aria-label="Open full patent text"
+                    title="Open full patent text"
+                  >
+                    <ExternalLink className="h-4 w-4" />
+                  </a>
                 </Button>
               </div>
             </div>

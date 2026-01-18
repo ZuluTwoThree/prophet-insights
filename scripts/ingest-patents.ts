@@ -22,11 +22,13 @@ type LocalizedText = {
 
 type BigQueryPatentRecord = {
   publication_number?: string;
-  publication_date?: string;
-  filing_date?: string;
-  priority_date?: string;
+  publication_date?: string | number;
+  filing_date?: string | number;
+  priority_date?: string | number;
   title_localized?: LocalizedText[];
   abstract_localized?: LocalizedText[];
+  assignee?: string[];
+  inventor?: string[];
   cpc?: Array<Record<string, unknown>>;
   ipc?: Array<Record<string, unknown>>;
   assignee_harmonized?: Array<Record<string, unknown>>;
@@ -70,12 +72,23 @@ function parseArgs() {
     startDate: "2024-01-01",
     endDate: undefined as string | undefined,
     sourceFile: undefined as string | undefined,
+    includeCitations: false,
+    dryRun: false,
+    maxBytesBilled: undefined as number | undefined,
   };
 
   const parsed: Record<string, string> = {};
   for (const arg of process.argv.slice(2)) {
-    const [key, value] = arg.replace(/^--/, "").split("=");
-    if (key && value) parsed[key] = value;
+    const normalized = arg.replace(/^--/, "");
+    if (!normalized) continue;
+    const eqIndex = normalized.indexOf("=");
+    if (eqIndex === -1) {
+      parsed[normalized] = "true";
+      continue;
+    }
+    const key = normalized.slice(0, eqIndex);
+    const value = normalized.slice(eqIndex + 1);
+    if (key) parsed[key] = value;
   }
 
   return {
@@ -84,6 +97,9 @@ function parseArgs() {
     startDate: parsed.startDate ?? defaults.startDate,
     endDate: parsed.endDate ?? defaults.endDate,
     sourceFile: parsed.sourceFile ?? defaults.sourceFile,
+    includeCitations: parsed.includeCitations === "true" ? true : defaults.includeCitations,
+    dryRun: parsed.dryRun === "true" ? true : defaults.dryRun,
+    maxBytesBilled: parsed.maxBytesBilled ? Number(parsed.maxBytesBilled) : defaults.maxBytesBilled,
   };
 }
 
@@ -109,66 +125,153 @@ function resolveTableId() {
   return `${projectId}.${dataset}.${table}`;
 }
 
-async function fetchFromBigQuery(
-  page: number,
-  perPage: number,
-  startDate?: string,
-  endDate?: string,
-): Promise<BigQueryPatentRecord[]> {
-  const tableId = resolveTableId();
-  const offset = (page - 1) * perPage;
+type Cursor = {
+  date: number;
+  publicationNumber: string;
+};
 
-  const bigquery = new BigQuery({
-    projectId: process.env.BIGQUERY_PROJECT_ID || undefined,
-  });
+type QuerySpec = {
+  query: string;
+  params: Record<string, string | number>;
+};
 
-  const startDateInt = toDateInt(startDate);
-  const endDateInt = toDateInt(endDate);
-  const dateFilter = startDateInt ? "publication_date >= @startDate" : "1=1";
-  const endFilter = endDateInt ? "AND publication_date <= @endDate" : "";
+function buildQuerySpec(options: {
+  perPage: number;
+  startDate?: string;
+  endDate?: string;
+  includeCitations: boolean;
+  cursor?: Cursor;
+}): QuerySpec {
+  const startDateInt = toDateInt(options.startDate);
+  const endDateInt = toDateInt(options.endDate);
 
-  const query = `
-    SELECT
-      publication_number,
-      publication_date,
-      filing_date,
-      priority_date,
-      title_localized,
-      abstract_localized,
-      cpc,
-      ipc,
-      assignee_harmonized,
-      inventor_harmonized,
-      citation
-    FROM \`${tableId}\`
-    WHERE ${dateFilter}
-    ${endFilter}
-    ORDER BY publication_date DESC
-    LIMIT @limit
-    OFFSET @offset
-  `;
+  const fields = [
+    "publication_number",
+    "publication_date",
+    "filing_date",
+    "priority_date",
+    "title_localized",
+    "abstract_localized",
+    "assignee",
+    "inventor",
+    "cpc",
+    "ipc",
+    "assignee_harmonized",
+    "inventor_harmonized",
+  ];
 
+  if (options.includeCitations) {
+    fields.push("citation");
+  }
+
+  const whereParts: string[] = [];
   const params: Record<string, string | number> = {
-    limit: perPage,
-    offset,
+    limit: options.perPage,
   };
 
   if (startDateInt) {
+    whereParts.push("publication_date >= @startDate");
     params.startDate = startDateInt;
   }
 
   if (endDateInt) {
+    whereParts.push("publication_date <= @endDate");
     params.endDate = endDateInt;
   }
 
-  const options = {
-    query,
-    location: process.env.BIGQUERY_LOCATION ?? "US",
+  if (options.cursor) {
+    whereParts.push(
+      "(publication_date > @cursorDate OR (publication_date = @cursorDate AND publication_number > @cursorNumber))",
+    );
+    params.cursorDate = options.cursor.date;
+    params.cursorNumber = options.cursor.publicationNumber;
+  }
+
+  const whereClause = whereParts.length ? whereParts.join(" AND ") : "1=1";
+
+  return {
+    query: `
+    SELECT
+      ${fields.join(",\n      ")}
+    FROM \`${resolveTableId()}\`
+    WHERE ${whereClause}
+    ORDER BY publication_date ASC, publication_number ASC
+    LIMIT @limit
+  `,
     params,
   };
+}
 
+function buildQueryOptions(
+  querySpec: QuerySpec,
+  options?: { maxBytesBilled?: number; dryRun?: boolean },
+) {
+  const queryOptions: Record<string, unknown> = {
+    query: querySpec.query,
+    params: querySpec.params,
+    location: process.env.BIGQUERY_LOCATION ?? "US",
+    useQueryCache: false,
+  };
+
+  if (options?.maxBytesBilled && Number.isFinite(options.maxBytesBilled)) {
+    queryOptions.maximumBytesBilled = String(Math.trunc(options.maxBytesBilled));
+  }
+
+  if (options?.dryRun) {
+    queryOptions.dryRun = true;
+  }
+
+  return queryOptions;
+}
+
+async function fetchFromBigQuery(
+  perPage: number,
+  startDate: string | undefined,
+  endDate: string | undefined,
+  includeCitations: boolean,
+  cursor: Cursor | undefined,
+  maxBytesBilled: number | undefined,
+): Promise<BigQueryPatentRecord[]> {
+  const bigquery = new BigQuery({
+    projectId: process.env.BIGQUERY_PROJECT_ID || undefined,
+  });
+
+  const querySpec = buildQuerySpec({
+    perPage,
+    startDate,
+    endDate,
+    includeCitations,
+    cursor,
+  });
+  const options = buildQueryOptions(querySpec, { maxBytesBilled });
   const [rows] = await bigquery.query(options);
   return rows as BigQueryPatentRecord[];
+}
+
+async function estimateQueryBytes(options: {
+  perPage: number;
+  startDate?: string;
+  endDate?: string;
+  includeCitations: boolean;
+  cursor?: Cursor;
+  maxBytesBilled?: number;
+}) {
+  const bigquery = new BigQuery({
+    projectId: process.env.BIGQUERY_PROJECT_ID || undefined,
+  });
+
+  const querySpec = buildQuerySpec(options);
+  const queryOptions = buildQueryOptions(querySpec, {
+    maxBytesBilled: options.maxBytesBilled,
+    dryRun: true,
+  });
+
+  const [, metadata] = await bigquery.query(queryOptions);
+  const bytes =
+    Number(metadata?.statistics?.totalBytesProcessed ?? 0) ||
+    Number(metadata?.statistics?.query?.totalBytesProcessed ?? 0);
+
+  return bytes;
 }
 
 function pickLocalizedText(entries?: LocalizedText[]) {
@@ -183,6 +286,11 @@ function readString(value: unknown) {
     if (trimmed) return trimmed;
   }
   return undefined;
+}
+
+function stableId(prefix: string, value: string) {
+  const digest = crypto.createHash("sha1").update(value).digest("hex");
+  return `${prefix}_${digest}`;
 }
 
 function getString(record: Record<string, unknown> | null | undefined, keys: string[]) {
@@ -206,11 +314,38 @@ function splitName(name?: string) {
   };
 }
 
+function normalizeAssigneeName(name: string) {
+  const trimmed = name.trim();
+  if (!trimmed) return null;
+  return {
+    id: stableId("assignee", trimmed),
+    name: trimmed,
+  };
+}
+
+function normalizeInventorName(name: string) {
+  const trimmed = name.trim();
+  if (!trimmed) return null;
+  const split = splitName(trimmed);
+  if (!split.firstName && !split.lastName) return null;
+  return {
+    id: stableId("inventor", trimmed),
+    firstName: split.firstName,
+    lastName: split.lastName,
+  };
+}
+
 function toDateInt(value?: string) {
   if (!value) return undefined;
   const cleaned = value.replace(/-/g, "");
   if (!/^\d{8}$/.test(cleaned)) return undefined;
   return Number(cleaned);
+}
+
+function toDateIntFromValue(value?: string | number | Date | null) {
+  const dateString = toDateString(value);
+  if (!dateString) return undefined;
+  return toDateInt(dateString);
 }
 
 function toDateString(value?: string | number | Date | null) {
@@ -282,6 +417,56 @@ function normalizeBigQueryPatent(record: BigQueryPatentRecord): NormalizedPatent
   const inventorEntries = Array.isArray(record.inventor_harmonized) ? record.inventor_harmonized : [];
   const citationEntries = Array.isArray(record.citation) ? record.citation : [];
   const cpcEntries = Array.isArray(record.cpc) ? record.cpc : [];
+  const assigneeNames = Array.isArray(record.assignee) ? record.assignee : [];
+  const inventorNames = Array.isArray(record.inventor) ? record.inventor : [];
+
+  const harmonizedAssignees = assigneeEntries.flatMap((assignee) => {
+    const name = getString(assignee, ["name", "organization", "assignee_organization"]);
+    if (!name) return [];
+    const idValue = getString(assignee, ["assignee_id", "id"]) ?? stableId("assignee", name);
+    return [
+      {
+        id: idValue,
+        name,
+        country: getString(assignee, ["country_code", "country"]),
+        state: getString(assignee, ["state", "region"]),
+        city: getString(assignee, ["city"]),
+      },
+    ];
+  });
+
+  const fallbackAssignees = assigneeNames
+    .map((name) => normalizeAssigneeName(name))
+    .filter((entry): entry is NonNullable<typeof entry> => Boolean(entry));
+
+  const harmonizedInventors = inventorEntries.flatMap((inventor) => {
+    const firstName =
+      getString(inventor, ["first_name", "given_name", "firstName", "inventor_first_name"]) ?? undefined;
+    const lastName =
+      getString(inventor, ["last_name", "family_name", "lastName", "inventor_last_name"]) ?? undefined;
+    const name = getString(inventor, ["name", "name_full", "inventor_name"]);
+    const split = splitName(name);
+    const resolvedFirst = firstName ?? split.firstName;
+    const resolvedLast = lastName ?? split.lastName;
+    if (!resolvedFirst && !resolvedLast) return [];
+    const fallbackName = [resolvedFirst, resolvedLast].filter(Boolean).join(" ").trim();
+    return [
+      {
+        id:
+          getString(inventor, ["inventor_id", "id"]) ??
+          stableId("inventor", name ?? fallbackName),
+        firstName: resolvedFirst,
+        lastName: resolvedLast,
+        country: getString(inventor, ["country_code", "country"]),
+        state: getString(inventor, ["state", "region"]),
+        city: getString(inventor, ["city"]),
+      },
+    ];
+  });
+
+  const fallbackInventors = inventorNames
+    .map((name) => normalizeInventorName(name))
+    .filter((entry): entry is NonNullable<typeof entry> => Boolean(entry));
 
   return {
     id,
@@ -293,42 +478,8 @@ function normalizeBigQueryPatent(record: BigQueryPatentRecord): NormalizedPatent
     publicationDate: toDateString(record.publication_date ?? null),
     priorityDate: toDateString(record.priority_date ?? null),
     filingDate: toDateString(record.filing_date ?? null),
-    assignees: assigneeEntries.flatMap((assignee) => {
-      const name =
-        getString(assignee, ["name", "organization", "assignee_organization"]) ?? "Unknown Assignee";
-      const idValue = getString(assignee, ["assignee_id", "id"]) ?? name;
-      if (!name) return [];
-      return [
-        {
-          id: idValue,
-          name,
-          country: getString(assignee, ["country_code", "country"]),
-          state: getString(assignee, ["state", "region"]),
-          city: getString(assignee, ["city"]),
-        },
-      ];
-    }),
-    inventors: inventorEntries.flatMap((inventor) => {
-      const firstName =
-        getString(inventor, ["first_name", "given_name", "firstName", "inventor_first_name"]) ?? undefined;
-      const lastName =
-        getString(inventor, ["last_name", "family_name", "lastName", "inventor_last_name"]) ?? undefined;
-      const name = getString(inventor, ["name", "name_full", "inventor_name"]);
-      const split = splitName(name);
-      const resolvedFirst = firstName ?? split.firstName;
-      const resolvedLast = lastName ?? split.lastName;
-      if (!resolvedFirst && !resolvedLast) return [];
-      return [
-        {
-          id: getString(inventor, ["inventor_id", "id"]) ?? crypto.randomUUID(),
-          firstName: resolvedFirst,
-          lastName: resolvedLast,
-          country: getString(inventor, ["country_code", "country"]),
-          state: getString(inventor, ["state", "region"]),
-          city: getString(inventor, ["city"]),
-        },
-      ];
-    }),
+    assignees: harmonizedAssignees.length ? harmonizedAssignees : fallbackAssignees,
+    inventors: harmonizedInventors.length ? harmonizedInventors : fallbackInventors,
     classifications: [
       ...ipcCodes.map((code) => ({ code, scheme: "ipc" as const, description: undefined })),
       ...cpcCodes.map((code) => {
@@ -519,16 +670,42 @@ async function main() {
   if (args.sourceFile) {
     batches.push(await readLocalSource(args.sourceFile));
   } else {
+    if (args.dryRun) {
+      const bytes = await estimateQueryBytes({
+        perPage: args.pageSize,
+        startDate: args.startDate,
+        endDate: args.endDate,
+        includeCitations: args.includeCitations,
+        maxBytesBilled: args.maxBytesBilled,
+      });
+      const gib = bytes / 1024 ** 3;
+      console.log(`Dry run estimate: ${bytes} bytes (${gib.toFixed(2)} GiB)`);
+      return;
+    }
+
     let fetched = 0;
-    let page = 1;
+    let cursor: Cursor | undefined;
     while (fetched < args.limit) {
-      const rows = await fetchFromBigQuery(page, args.pageSize, args.startDate, args.endDate);
+      const rows = await fetchFromBigQuery(
+        args.pageSize,
+        args.startDate,
+        args.endDate,
+        args.includeCitations,
+        cursor,
+        args.maxBytesBilled,
+      );
       if (!rows.length) break;
       const remaining = args.limit - fetched;
       const batch = rows.slice(0, remaining);
       batches.push(batch);
       fetched += batch.length;
-      page += 1;
+
+      const last = batch[batch.length - 1];
+      const lastDate = toDateIntFromValue(last?.publication_date ?? null);
+      if (!lastDate || !last?.publication_number) {
+        break;
+      }
+      cursor = { date: lastDate, publicationNumber: last.publication_number };
     }
   }
 
